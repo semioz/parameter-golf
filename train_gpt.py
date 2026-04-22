@@ -965,6 +965,10 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    if args.qat_enabled:
+        for module in base_model.modules():
+            if isinstance(module, CastedLinear):
+                module._qat = True
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1099,7 +1103,6 @@ def main() -> None:
     # MAIN TRAINING LOOP
     # -----------------------------
 
-    qat_active = False
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1171,15 +1174,7 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
-        # Activate QAT after warmup fraction
-        if args.qat_enabled and not qat_active:
-            frac_done = elapsed_ms / max_wallclock_ms if max_wallclock_ms else step / args.iterations
-            if frac_done >= args.qat_start_frac:
-                for m in base_model.modules():
-                    if isinstance(m, CastedLinear):
-                        m._qat = True
-                qat_active = True
-                log0(f"qat:activated at step {step + 1}")
+        # QAT is enabled before torch.compile so the compiled graph includes it
 
         # EMA update
         if ema_state:

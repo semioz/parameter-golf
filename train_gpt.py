@@ -416,23 +416,17 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
     return t
 
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
+    # Must match CastedLinear QAT: amax-based scale, no percentile clipping
     t32 = t.float()
     if t32.ndim == 2:
-        clip_abs = (
-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
-            if t32.numel()
-            else torch.empty((t32.shape[0],), dtype=torch.float32)
-        )
-        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q_raw = torch.round(clipped / scale[:, None])
-        # Int6: round to multiples of 4 (64 levels) for better compression
+        scale = t32.abs().amax(dim=-1).clamp_min(1e-12) / 127.0
+        q_raw = torch.round(t32 / scale[:, None])
         q = torch.clamp((torch.round(q_raw / 4) * 4), -128, 124).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
-    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
+    scale_val = t32.abs().amax().clamp_min(1e-12).item() / 127.0
+    scale = torch.tensor(scale_val, dtype=torch.float32)
+    q = torch.clamp(torch.round(t32 / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):

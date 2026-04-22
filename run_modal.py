@@ -11,7 +11,7 @@ image = (
     .apt_install("git")
     .pip_install(
         "numpy", "tqdm", "torch", "huggingface-hub", "setuptools",
-        "typing-extensions==4.15.0", "sentencepiece", "wandb", "zstandard",
+        "typing-extensions==4.15.0", "sentencepiece", "wandb", "brotli",
     )
 )
 

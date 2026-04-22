@@ -27,9 +27,9 @@ try:
 except ImportError:
     wandb = None
 try:
-    import zstandard as zstd_mod
+    import brotli as brotli_mod
 except ImportError:
-    zstd_mod = None
+    brotli_mod = None
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
@@ -93,19 +93,19 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    muon_wd = float(os.environ.get("MUON_WD", 0.085))
+    muon_wd = float(os.environ.get("MUON_WD", 0.10))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
-    # Int6 QAT: fake-quantize weights during training so model learns to tolerate 6-bit precision
+    # Int6 QAT: fake-quantize weights during training so model learns to tolerate 6-bit precision.
+    # QAT is baked into the torch.compile graph, so it must be enabled before compilation (from step 0).
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
-    qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.15))
 
     # EMA: exponential moving average of weights for smoother final model
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
 
     # Compression
-    use_zstd = bool(int(os.environ.get("USE_ZSTD", "1")))
-    zstd_level = int(os.environ.get("ZSTD_LEVEL", 22))
+    use_brotli = bool(int(os.environ.get("USE_BROTLI", "1")))
+    brotli_quality = int(os.environ.get("BROTLI_QUALITY", 11))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -401,8 +401,6 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
-INT8_CLIP_PERCENTILE = 99.99984
-INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -1232,10 +1230,9 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    if args.use_zstd and zstd_mod is not None:
-        cctx = zstd_mod.ZstdCompressor(level=args.zstd_level)
-        quant_blob = cctx.compress(quant_raw)
-        compress_label = f"int6+zstd{args.zstd_level}"
+    if args.use_brotli and brotli_mod is not None:
+        quant_blob = brotli_mod.compress(quant_raw, quality=args.brotli_quality)
+        compress_label = f"int6+brotli"
     else:
         quant_blob = zlib.compress(quant_raw, level=9)
         compress_label = "int6+zlib"
@@ -1256,9 +1253,8 @@ def main() -> None:
         dist.barrier()
     with open("final_model.int6.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    if args.use_zstd and zstd_mod is not None:
-        dctx = zstd_mod.ZstdDecompressor()
-        quant_state = torch.load(io.BytesIO(dctx.decompress(quant_blob_disk)), map_location="cpu")
+    if args.use_brotli and brotli_mod is not None:
+        quant_state = torch.load(io.BytesIO(brotli_mod.decompress(quant_blob_disk)), map_location="cpu")
     else:
         quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)

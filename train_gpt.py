@@ -99,7 +99,8 @@ class Hyperparameters:
     # Int6 QAT: fake-quantize weights during training so model learns to tolerate 6-bit precision.
     # QAT is baked into the torch.compile graph, so it must be enabled before compilation (from step 0).
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
-    qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.15))
+    late_qat = bool(int(os.environ.get("LATE_QAT", "1")))
+    qat_threshold = float(os.environ.get("QAT_THRESHOLD", 0.1))
 
     # EMA: exponential moving average of weights for smoother final model
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
@@ -414,21 +415,39 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
-def quantize_float_tensor(t: Tensor, int6_snap: bool = True) -> tuple[Tensor, Tensor]:
+def quantize_int6_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
-        scale = t32.abs().amax(dim=-1).clamp_min(1e-12) / 127.0
-        q_raw = torch.round(t32 / scale[:, None])
-        if int6_snap:
-            q = torch.clamp((torch.round(q_raw / 4) * 4), -128, 124).to(torch.int8).contiguous()
-        else:
-            q = torch.clamp(q_raw, -127, 127).to(torch.int8).contiguous()
+        scale = (t32.abs().amax(dim=-1) / 31.0).clamp_min(1.0 / 31.0)
+        q = torch.clamp(torch.round(t32 / scale[:, None]), -32, 31).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+
+    scale_val = max(t32.abs().amax().item() / 31.0, 1.0 / 31.0)
+    scale = torch.tensor(scale_val, dtype=torch.float32)
+    q = torch.clamp(torch.round(t32 / scale), -32, 31).to(torch.int8).contiguous()
+    return q, scale
+
+
+def fake_quantize_int6_per_row(t: Tensor) -> Tensor:
+    q, scale = quantize_int6_per_row(t)
+    if q.ndim == 2:
+        return (q.float() * scale.float()[:, None]).to(dtype=t.dtype).contiguous()
+    return (q.float() * scale.float()).to(dtype=t.dtype).contiguous()
+
+
+def quantize_float_tensor(t: Tensor, int6_snap: bool = True) -> tuple[Tensor, Tensor]:
+    t32 = t.float()
+    if int6_snap:
+        return quantize_int6_per_row(t)
 
     scale_val = t32.abs().amax().clamp_min(1e-12).item() / 127.0
     scale = torch.tensor(scale_val, dtype=torch.float32)
     q = torch.clamp(torch.round(t32 / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
+
+
+def should_enable_late_qat(qat_enabled: bool, lr_scale: float, threshold: float) -> bool:
+    return qat_enabled and lr_scale < threshold
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
@@ -466,10 +485,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
-        # Embeddings use int8 (256 levels) — no QAT needed for that precision.
-        # Other weights use int6 (64 levels) matching the CastedLinear QAT scheme.
-        use_int6 = "tok_emb" not in name
-        q, s = quantize_float_tensor(t, int6_snap=use_int6)
+        q, s = quantize_float_tensor(t)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
@@ -599,22 +615,13 @@ class RMSNorm(nn.Module):
 
 
 class CastedLinear(nn.Linear):
-    _qat: bool = False
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.register_buffer('_qat_noise_scale', torch.tensor(1.0), persistent=False)
+    _qat_enabled: bool = False
 
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
-        if self._qat and self.training and w.ndim == 2:
-            w_f = w.float()
-            scale = w_f.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / 127.0
-            q = (w_f / scale).round()
-            q = (q / 4).round() * 4
-            q = q.clamp(-128, 124)
-            w_q = q * scale
-            w = w + (w_q - w_f).detach() * self._qat_noise_scale
+        if CastedLinear._qat_enabled and self.training and w.ndim == 2:
+            w_q = fake_quantize_int6_per_row(w.float())
+            w = w + (w_q - w.float()).detach()
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w.to(x.dtype), bias)
 
@@ -772,7 +779,9 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self._emb_qat: bool = False
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.register_buffer('_emb_qat_noise_scale', torch.tensor(1.0), persistent=False)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -803,13 +812,25 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def _maybe_qat_emb(self) -> Tensor:
+        w = self.tok_emb.weight
+        if self._emb_qat and self.training:
+            w_f = w.float()
+            scale = w_f.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / 127.0
+            q = (w_f / scale).round()
+            q = (q / 4).round() * 4
+            q = q.clamp(-128, 124)
+            w_q = q * scale
+            w = w + (w_q - w_f).detach() * self._emb_qat_noise_scale
+        return w
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
+        emb_w = self._maybe_qat_emb()
+        x = F.embedding(input_ids, emb_w)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
 
-        # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
@@ -821,7 +842,7 @@ class GPT(nn.Module):
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            logits_proj = F.linear(x, emb_w)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
@@ -971,11 +992,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    if args.qat_enabled:
-        for module in base_model.modules():
-            if isinstance(module, CastedLinear):
-                module._qat = True
-                module._qat_noise_scale.zero_()
+    CastedLinear._qat_enabled = args.qat_enabled and not args.late_qat
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1181,12 +1198,9 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
-        # Enable QAT noise after warmup so model stabilizes first
-        if args.qat_enabled and step == int(args.qat_start_frac * args.iterations):
-            log0(f"qat:enabling quantization noise at step {step}")
-            for module in base_model.modules():
-                if isinstance(module, CastedLinear):
-                    module._qat_noise_scale.fill_(1.0)
+        if args.late_qat and should_enable_late_qat(args.qat_enabled, scale, args.qat_threshold) and not CastedLinear._qat_enabled:
+            CastedLinear._qat_enabled = True
+            log0(f"late_qat:enabled step:{step} lr_scale:{scale:.4f}")
 
         # EMA update
         if ema_state:
@@ -1226,7 +1240,6 @@ def main() -> None:
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
 
-    # Swap in EMA weights for export
     if ema_state:
         log0("ema:swapping in EMA weights for export")
         for name, p in base_model.named_parameters():

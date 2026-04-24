@@ -70,7 +70,7 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 4096))
-    num_layers = int(os.environ.get("NUM_LAYERS", 11))
+    num_layers = int(os.environ.get("NUM_LAYERS", 10))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -93,12 +93,13 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    muon_wd = float(os.environ.get("MUON_WD", 0.10))
+    muon_wd = float(os.environ.get("MUON_WD", 0.085))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
     # Int6 QAT: fake-quantize weights during training so model learns to tolerate 6-bit precision.
     # QAT is baked into the torch.compile graph, so it must be enabled before compilation (from step 0).
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
+    qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.15))
 
     # EMA: exponential moving average of weights for smoother final model
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
@@ -413,13 +414,15 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
-def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
-    # Must match CastedLinear QAT: amax-based scale, no percentile clipping
+def quantize_float_tensor(t: Tensor, int6_snap: bool = True) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
         scale = t32.abs().amax(dim=-1).clamp_min(1e-12) / 127.0
         q_raw = torch.round(t32 / scale[:, None])
-        q = torch.clamp((torch.round(q_raw / 4) * 4), -128, 124).to(torch.int8).contiguous()
+        if int6_snap:
+            q = torch.clamp((torch.round(q_raw / 4) * 4), -128, 124).to(torch.int8).contiguous()
+        else:
+            q = torch.clamp(q_raw, -127, 127).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
     scale_val = t32.abs().amax().clamp_min(1e-12).item() / 127.0
@@ -456,16 +459,17 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             stats["int8_payload_bytes"] += tensor_nbytes(t)
             continue
 
-        # Embeddings are sensitive to quantization — keep them in fp16.
-        # Small float tensors are also cheap enough to keep directly.
-        if "tok_emb" in name or t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t)
+        # Embeddings use int8 (256 levels) — no QAT needed for that precision.
+        # Other weights use int6 (64 levels) matching the CastedLinear QAT scheme.
+        use_int6 = "tok_emb" not in name
+        q, s = quantize_float_tensor(t, int6_snap=use_int6)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
@@ -597,6 +601,10 @@ class RMSNorm(nn.Module):
 class CastedLinear(nn.Linear):
     _qat: bool = False
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.register_buffer('_qat_noise_scale', torch.tensor(1.0), persistent=False)
+
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
         if self._qat and self.training and w.ndim == 2:
@@ -606,7 +614,7 @@ class CastedLinear(nn.Linear):
             q = (q / 4).round() * 4
             q = q.clamp(-128, 124)
             w_q = q * scale
-            w = w + (w_q - w_f).detach()
+            w = w + (w_q - w_f).detach() * self._qat_noise_scale
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w.to(x.dtype), bias)
 
@@ -967,6 +975,7 @@ def main() -> None:
         for module in base_model.modules():
             if isinstance(module, CastedLinear):
                 module._qat = True
+                module._qat_noise_scale.zero_()
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1172,7 +1181,12 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
-        # QAT is enabled before torch.compile so the compiled graph includes it
+        # Enable QAT noise after warmup so model stabilizes first
+        if args.qat_enabled and step == int(args.qat_start_frac * args.iterations):
+            log0(f"qat:enabling quantization noise at step {step}")
+            for module in base_model.modules():
+                if isinstance(module, CastedLinear):
+                    module._qat_noise_scale.fill_(1.0)
 
         # EMA update
         if ema_state:
